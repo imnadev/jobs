@@ -2,7 +2,7 @@ import os
 import logging
 import asyncio
 import aiohttp
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
@@ -57,14 +57,22 @@ user_states: Dict[int, Dict] = {}
 API_HEADERS = {
     'api_version': '1',
     'device_os': 'WINDOWS',
-    'language': 'uz'
+    'language': 'en'
 }
 
 async def search_stations(query: str) -> List[Dict]:
     """Search for stations by query."""
     url = f"https://tickets.atto.uz/v1.0/customer/railways/stations/list?search={query}"
     
-    async with aiohttp.ClientSession() as session:
+    # Create SSL context that ignores certificate verification
+    import ssl
+    ssl_context = ssl.create_default_context()
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
+    
+    connector = aiohttp.TCPConnector(ssl=ssl_context)
+    
+    async with aiohttp.ClientSession(connector=connector) as session:
         async with session.get(url, headers=API_HEADERS) as response:
             if response.status == 200:
                 data = await response.json()
@@ -85,7 +93,15 @@ async def search_trains(station_from: int, station_to: int, from_name: str, to_n
         'transportType': 'train'
     }
     
-    async with aiohttp.ClientSession() as session:
+    # Create SSL context that ignores certificate verification
+    import ssl
+    ssl_context = ssl.create_default_context()
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
+    
+    connector = aiohttp.TCPConnector(ssl=ssl_context)
+    
+    async with aiohttp.ClientSession(connector=connector) as session:
         async with session.get(url, headers=API_HEADERS, params=params) as response:
             if response.status == 200:
                 data = await response.json()
@@ -206,30 +222,51 @@ async def show_train_selection(update: Update, user_id: int) -> None:
     from_name = job.from_station['name']
     to_name = job.to_station['name']
     
-    # Use first date from range for search
-    start_date = job.date_range.split('-')[0].strip()
+    # Parse date range and loop through all dates
+    start_date_str, end_date_str = job.date_range.split('-')
+    start_date = datetime.strptime(start_date_str.strip(), '%d.%m.%Y')
+    end_date = datetime.strptime(end_date_str.strip(), '%d.%m.%Y')
     
-    trains = await search_trains(from_code, to_code, from_name, to_name, start_date)
+    all_trains = []
+    current_date = start_date
     
-    if not trains:
-        await update.message.reply_text("No trains found for the selected route and date.")
+    while current_date <= end_date:
+        date_str = current_date.strftime('%d.%m.%Y')
+        trains = await search_trains(from_code, to_code, from_name, to_name, date_str)
+        
+        # Add date info to each train for display
+        for train in trains:
+            train['search_date'] = date_str
+        
+        all_trains.extend(trains)
+        current_date += timedelta(days=1)
+    
+    if not all_trains:
+        await update.message.reply_text("No trains found for the selected route and date range.")
         return
     
     # Store trains for selection
-    user_states[user_id]['available_trains'] = trains
+    user_states[user_id]['available_trains'] = all_trains
     
-    # Create inline keyboard
+    # Pre-select all trains
+    job.selected_trains = []
+    for train in all_trains:
+        train_key = f"{train['number']}_{train['departure']['time']}_{train['search_date']}"
+        job.selected_trains.append(train_key)
+    
+    # Create inline keyboard with all trains selected
     keyboard = []
-    for i, train in enumerate(trains):
+    for i, train in enumerate(all_trains):
+        train_key_current = f"{train['number']}_{train['departure']['time']}_{train['search_date']}"
         keyboard.append([InlineKeyboardButton(
-            f"Train {train['number']} - {train['departure']['time']} → {train['arrival']['time']}",
+            f"✅ {train['search_date']} - Train {train['number']} - {train['departure']['time']} → {train['arrival']['time']}",
             callback_data=f"train_{i}"
         )])
     
     keyboard.append([InlineKeyboardButton("Submit Selection", callback_data="submit_trains")])
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await update.message.reply_text("Select trains to monitor:", reply_markup=reply_markup)
+    await update.message.reply_text(f"All trains selected ({len(job.selected_trains)}) across all dates. You can deselect any you don't want:", reply_markup=reply_markup)
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle inline keyboard callbacks."""
@@ -255,8 +292,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def handle_station_selection(query, user_id: int, station_type: str, data: str) -> None:
     """Handle station selection."""
     parts = data.split('_')
-    code = int(parts[2])
-    name = parts[3]
+    # Format: select_from_station_CODE_NAME or select_to_station_CODE_NAME
+    # parts = ['select', 'from', 'station', 'CODE', 'NAME', ...]
+    if len(parts) < 4:
+        return
+    
+    code = int(parts[3])  # Code is at index 3
+    name = '_'.join(parts[4:]) if len(parts) > 4 else ''  # Name starts from index 4
     
     if station_type == 'from_station':
         jobs[user_id].from_station = {'code': code, 'name': name}
@@ -275,16 +317,29 @@ async def handle_train_selection(query, user_id: int, data: str) -> None:
     
     job = jobs[user_id]
     
-    # Toggle selection
-    train_key = f"{selected_train['number']}_{selected_train['departure']['time']}"
+    # Toggle selection with date-included key
+    train_key = f"{selected_train['number']}_{selected_train['departure']['time']}_{selected_train['search_date']}"
     if train_key in job.selected_trains:
         job.selected_trains.remove(train_key)
     else:
         job.selected_trains.append(train_key)
     
-    # Update message
+    # Recreate the keyboard with updated selection status
+    keyboard = []
+    for i, train in enumerate(trains):
+        train_key_current = f"{train['number']}_{train['departure']['time']}_{train['search_date']}"
+        status = "✅ " if train_key_current in job.selected_trains else ""
+        keyboard.append([InlineKeyboardButton(
+            f"{status}{train['search_date']} - Train {train['number']} - {train['departure']['time']} → {train['arrival']['time']}",
+            callback_data=f"train_{i}"
+        )])
+    
+    keyboard.append([InlineKeyboardButton("Submit Selection", callback_data="submit_trains")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    # Update message with selection count and keep keyboard
     selected_text = f"Selected trains: {len(job.selected_trains)}"
-    await query.edit_message_text(selected_text)
+    await query.edit_message_text(selected_text, reply_markup=reply_markup)
 
 async def submit_train_selection(query, user_id: int) -> None:
     """Submit train selection and move to car type selection."""
@@ -294,17 +349,29 @@ async def submit_train_selection(query, user_id: int) -> None:
         await query.edit_message_text("Please select at least one train.")
         return
     
-    # Show car type selection
+    # Pre-select Sleeper and Coupe car types
+    job.car_types = ['Sleeper', 'Coupe']
+    
+    # Show car type selection with pre-selected options
     keyboard = [
-        [InlineKeyboardButton("Sleeper", callback_data="car_type_Sleeper")],
-        [InlineKeyboardButton("Coupe", callback_data="car_type_Coupe")],
-        [InlineKeyboardButton("Others", callback_data="car_type_Others")],
+        [InlineKeyboardButton(
+            f"✅ Sleeper", 
+            callback_data="car_type_Sleeper"
+        )],
+        [InlineKeyboardButton(
+            f"✅ Coupe", 
+            callback_data="car_type_Coupe"
+        )],
+        [InlineKeyboardButton(
+            f"Others", 
+            callback_data="car_type_Others"
+        )],
         [InlineKeyboardButton("Submit Selection", callback_data="submit_car_types")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     user_states[user_id]['step'] = 'car_types'
-    await query.edit_message_text("Select car types to monitor:", reply_markup=reply_markup)
+    await query.edit_message_text(f"Sleeper and Coupe selected by default. You can modify your selection:", reply_markup=reply_markup)
 
 async def handle_car_type_selection(query, user_id: int, data: str) -> None:
     """Handle car type selection."""
@@ -317,8 +384,26 @@ async def handle_car_type_selection(query, user_id: int, data: str) -> None:
     else:
         job.car_types.append(car_type)
     
+    # Recreate the keyboard with updated selection status
+    keyboard = [
+        [InlineKeyboardButton(
+            f"{'✅ ' if 'Sleeper' in job.car_types else ''}Sleeper", 
+            callback_data="car_type_Sleeper"
+        )],
+        [InlineKeyboardButton(
+            f"{'✅ ' if 'Coupe' in job.car_types else ''}Coupe", 
+            callback_data="car_type_Coupe"
+        )],
+        [InlineKeyboardButton(
+            f"{'✅ ' if 'Others' in job.car_types else ''}Others", 
+            callback_data="car_type_Others"
+        )],
+        [InlineKeyboardButton("Submit Selection", callback_data="submit_car_types")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
     selected_text = f"Selected car types: {', '.join(job.car_types) if job.car_types else 'None'}"
-    await query.edit_message_text(selected_text)
+    await query.edit_message_text(selected_text, reply_markup=reply_markup)
 
 async def submit_car_types(query, user_id: int) -> None:
     """Submit car type selection and move to interval setting."""
@@ -451,18 +536,29 @@ async def monitor_trains(update: Update, user_id: int) -> None:
                 date_str = current_date.strftime('%d.%m.%Y')
                 trains = await search_trains(from_code, to_code, from_name, to_name, date_str)
                 
+                logger.info(f"Searching trains for {date_str}: found {len(trains)} trains")
+                for train in trains:
+                    logger.info(f"  - Train {train['number']} at {train['departure']['time']}")
+                
                 available_trains = []
                 for train in trains:
-                    train_key = f"{train['number']}_{train['departure']['time']}"
+                    train_key = f"{train['number']}_{train['departure']['time']}_{date_str}"
                     if train_key in job.selected_trains:
+                        logger.info(f"Checking train {train_key} - found {len(train.get('cars', []))} car types")
                         for car in train.get('cars', []):
+                            logger.info(f"  - Car {car['typeShow']}: {car['freeSeats']} seats, selected: {car['typeShow'] in job.car_types}")
                             if car['typeShow'] in job.car_types and int(car['freeSeats']) > 0:
                                 available_trains.append({
                                     'train': train,
                                     'car': car,
                                     'date': date_str
                                 })
+                                logger.info(f"  ✓ Found available ticket!")
                                 break
+                    else:
+                        # Debug: log why train didn't match
+                        logger.info(f"Train not found in selection: {train_key}")
+                        logger.info(f"Selected trains: {job.selected_trains[:3]}...")  # Show first 3
                 
                 if available_trains:
                     message = f"🎫 Tickets Available for {date_str}!\n\n"
@@ -479,7 +575,7 @@ async def monitor_trains(update: Update, user_id: int) -> None:
                     
                     total_tickets_found += len(available_trains)
                 
-                current_date += datetime.timedelta(days=1)
+                current_date += timedelta(days=1)
             
             if total_tickets_found > 0:
                 job.add_request_status("Tickets found", total_tickets_found)
